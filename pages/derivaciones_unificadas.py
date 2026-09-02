@@ -330,7 +330,7 @@ if st.button(
                     }
                 else:
                     cache_key = (
-                        "v5-inactivity-fallback",
+                        "v6-inactivity-consolidation",
                         str(actual_course["id"]),
                         tuple(sorted(str(value) for value in internal_ids)),
                         int(week),
@@ -435,6 +435,17 @@ if st.button(
                 "En esos casos la desconexión se calculó desde la última asistencia disponible o, "
                 "si nunca hubo actividad, desde el inicio efectivo del curso/matrícula. "
                 "El Excel identifica estos valores como estimados."
+            )
+        consolidated_fallbacks = 0
+        for column in ("course_1_inactivity_source", "course_2_inactivity_source"):
+            if column in combined.columns:
+                consolidated_fallbacks += int(
+                    combined[column].fillna("").astype(str).str.contains("Respaldo final", regex=False).sum()
+                )
+        if consolidated_fallbacks:
+            st.warning(
+                f"Se reconstruyó la desconexión de {consolidated_fallbacks} registro(s) durante la consolidación final. "
+                "Estos valores ya no quedan vacíos y se identifican como estimados en el Excel."
             )
         if include_page_views and page_view_omissions:
             st.warning(

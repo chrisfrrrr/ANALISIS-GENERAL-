@@ -1,0 +1,22 @@
+V2.4 / V6 - GARANTÍA FINAL DE DESCONEXIÓN EN DERIVACIÓN UNIFICADA
+
+Problema corregido
+------------------
+En algunos estudiantes el segundo curso podía conservar inactivity_hours vacío al llegar a la etapa de consolidación, aun cuando el estudiante sí aparecía en ese curso y se habían calculado sus pendientes.
+
+Corrección
+----------
+1. Se agregó una segunda capa de resolución de desconexión dentro de combined_referral_service.py.
+2. Si inactivity_hours llega vacío, la consolidación intenta reconstruirlo desde:
+   - last_activity_at;
+   - inactivity_reference_at;
+   - como último respaldo, la semana seleccionada y la fecha de corte.
+3. Los valores reconstruidos se marcan como estimados y su origen queda registrado en el Excel.
+4. La caché de derivación unificada cambia a v6 para no reutilizar resultados parciales de V5.
+5. La interfaz informa cuántos registros fueron reconstruidos en la consolidación final.
+6. Los estudiantes que realmente no aparecen en un curso continúan mostrando "No aparece en el curso" y no se inventa una desconexión para ellos.
+
+Validación
+----------
+- 42 pruebas automatizadas superadas.
+- Prueba adicional de exportación Excel: un estudiante presente en Curso 2 con 6 pendientes y inactivity_hours nulo genera 504.0 h en semana 3 y el valor se conserva en el informe unificado.

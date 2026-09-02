@@ -27,6 +27,7 @@ def _row(user, carne, course_id, course_name, pending, inactivity, risk, advisor
         "completion_percentage": (6 - pending) / 6 * 100,
         "pending_assignments": [f"Pendiente {i+1}" for i in range(pending)],
         "last_activity_at": "2026-09-01T00:00:00+00:00",
+        "analysis_cutoff": "2026-09-02T23:59:59+00:00",
         "reasons": ["Prueba"],
         "asesor_bienestar": advisor,
     }
@@ -70,3 +71,39 @@ def test_package_contains_one_individual_referral_per_student():
         names = zf.namelist()
     assert any(name.endswith("Informe_unificado.xlsx") for name in names)
     assert sum("Derivacion_Unificada_" in name for name in names) == 1
+
+
+def test_present_student_never_leaves_course_inactivity_blank():
+    c1 = _row(7, 7007, 10, "Álgebra", 2, 30, "Moderado")
+    c2 = _row(7, 7007, 20, "Administración", 6, None, "Alto")
+    c2["last_activity_at"] = None
+    c2["inactivity_reference_at"] = None
+    c2["inactivity_source"] = None
+    c2["week_number"] = 3
+
+    combined = combine_course_analyses(
+        pd.DataFrame([c1, c2]),
+        [{"id": 10, "name": "Álgebra"}, {"id": 20, "name": "Administración"}],
+    )
+
+    row = combined.iloc[0]
+    assert row["courses_present"] == 2
+    assert row["course_2_inactivity_hours"] == 504.0
+    assert row["course_2_inactivity_estimated"] is True or bool(row["course_2_inactivity_estimated"]) is True
+    assert "Respaldo final" in row["course_2_inactivity_source"]
+    assert row["inactivity_total_hours"] == 534.0
+
+
+def test_consolidation_recovers_hours_from_last_activity_when_numeric_value_is_missing():
+    c1 = _row(8, 8008, 10, "Álgebra", 1, 20, "Moderado")
+    c2 = _row(8, 8008, 20, "Administración", 2, None, "Moderado")
+    c2["last_activity_at"] = "2026-09-01T23:59:59+00:00"
+
+    combined = combine_course_analyses(
+        pd.DataFrame([c1, c2]),
+        [{"id": 10, "name": "Álgebra"}, {"id": 20, "name": "Administración"}],
+    )
+
+    row = combined.iloc[0]
+    assert 23.9 <= row["course_2_inactivity_hours"] <= 24.1
+    assert row["course_2_inactivity_estimated"] is False or bool(row["course_2_inactivity_estimated"]) is False

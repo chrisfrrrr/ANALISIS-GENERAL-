@@ -3,10 +3,12 @@ from __future__ import annotations
 import io
 import re
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
+
+from utils.dates import hours_between, parse_datetime
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -82,6 +84,66 @@ def _max_label(values: list[Any], ranking: dict[str, int], default: str) -> str:
     return max(labels, key=lambda label: ranking[label])
 
 
+def _resolve_consolidated_inactivity(row: dict[str, Any]) -> dict[str, Any]:
+    """Garantía final para que un estudiante presente nunca salga sin desconexión.
+
+    El análisis normal ya resuelve ``last_activity_at`` nulo. Esta segunda capa
+    protege la consolidación cuando una fila parcial, heredada o duplicada llega
+    con ``inactivity_hours`` vacío. Se intenta reconstruir el valor sin nuevas
+    llamadas a Canvas y se marca explícitamente como estimado.
+    """
+    raw_hours = row.get("inactivity_hours")
+    if not _missing(raw_hours):
+        try:
+            return {
+                "inactivity_hours": round(float(raw_hours), 1),
+                "last_activity_at": row.get("last_activity_at"),
+                "inactivity_reference_at": row.get("inactivity_reference_at"),
+                "inactivity_estimated": bool(row.get("inactivity_estimated") or False),
+                "inactivity_source": row.get("inactivity_source") or "Última actividad reportada por Canvas",
+            }
+        except (TypeError, ValueError):
+            pass
+
+    cutoff = parse_datetime(row.get("analysis_cutoff"))
+    if cutoff is None:
+        cutoff = datetime.now(timezone.utc)
+
+    # Primero se reconstruye desde cualquier referencia ya disponible.
+    for label, raw_reference, estimated in (
+        ("Última actividad reportada por Canvas", row.get("last_activity_at"), False),
+        (row.get("inactivity_source") or "Referencia previa del análisis", row.get("inactivity_reference_at"), True),
+    ):
+        reference = parse_datetime(raw_reference)
+        if reference is not None:
+            recovered = hours_between(reference, cutoff)
+            if recovered is not None:
+                return {
+                    "inactivity_hours": round(recovered, 1),
+                    "last_activity_at": row.get("last_activity_at") if not estimated else None,
+                    "inactivity_reference_at": reference.isoformat(),
+                    "inactivity_estimated": estimated,
+                    "inactivity_source": str(label),
+                }
+
+    # Último respaldo: si el estudiante está presente en el curso y no existe
+    # ninguna fecha utilizable, la semana seleccionada ofrece un mínimo
+    # consistente con el mismo criterio utilizado por AnalysisService.
+    try:
+        safe_week = max(1, int(float(row.get("week_number") or 1)))
+    except (TypeError, ValueError):
+        safe_week = 1
+    reference = cutoff - timedelta(days=7 * safe_week)
+    recovered = hours_between(reference, cutoff)
+    return {
+        "inactivity_hours": round(float(recovered or 0.0), 1),
+        "last_activity_at": None,
+        "inactivity_reference_at": reference.isoformat(),
+        "inactivity_estimated": True,
+        "inactivity_source": "Sin actividad registrada · Respaldo final según semana analizada",
+    }
+
+
 def _course_payload(row: dict[str, Any] | None, course: dict[str, Any]) -> dict[str, Any]:
     if row is None:
         return {
@@ -105,6 +167,7 @@ def _course_payload(row: dict[str, Any] | None, course: dict[str, Any]) -> dict[
             "inactivity_source": "Sin datos",
             "reasons": [],
         }
+    inactivity = _resolve_consolidated_inactivity(row)
     return {
         "present": True,
         "course_id": str(row.get("course_id") or course.get("id") or ""),
@@ -116,14 +179,14 @@ def _course_payload(row: dict[str, Any] | None, course: dict[str, Any]) -> dict[
         "expected_activities": int(_number(row.get("expected_activities"))),
         "completed_activities": int(_number(row.get("completed_activities"))),
         "pending_count": int(_number(row.get("pending_count"))),
-        "inactivity_hours": None if _missing(row.get("inactivity_hours")) else round(_number(row.get("inactivity_hours")), 1),
+        "inactivity_hours": inactivity["inactivity_hours"],
         "average_grade": None if _missing(row.get("average_grade")) else round(_number(row.get("average_grade")), 2),
         "completion_percentage": round(_number(row.get("completion_percentage")), 2),
         "pending_assignments": _as_list(row.get("pending_assignments")),
-        "last_activity_at": row.get("last_activity_at"),
-        "inactivity_reference_at": row.get("inactivity_reference_at"),
-        "inactivity_estimated": bool(row.get("inactivity_estimated") or False),
-        "inactivity_source": row.get("inactivity_source") or "Última actividad reportada por Canvas",
+        "last_activity_at": inactivity["last_activity_at"],
+        "inactivity_reference_at": inactivity["inactivity_reference_at"],
+        "inactivity_estimated": inactivity["inactivity_estimated"],
+        "inactivity_source": inactivity["inactivity_source"],
         "reasons": _as_list(row.get("reasons")),
     }
 
