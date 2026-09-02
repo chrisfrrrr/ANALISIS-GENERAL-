@@ -1,0 +1,25 @@
+ALERTA TEMPRANA NIVELACIÓN v1.9
+================================
+
+Corrección principal
+--------------------
+Se corrigió el error de Supabase/PostgreSQL:
+  invalid input syntax for type integer: "0.0"
+
+Causa
+-----
+Algunos indicadores calculados por Pandas/Canvas podían llegar como valores
+flotantes o cadenas decimales (por ejemplo 0.0 o "0.0"), mientras que
+student_snapshots espera enteros en campos como week_number, actividades,
+pendientes, tardías, anticipadas y sesiones semanales.
+
+Solución
+--------
+- Normalización explícita de todos los campos INTEGER antes de guardar snapshots.
+- Soporte para int, float, cadenas como "0.0", valores numpy/pandas y NaN.
+- weekly_sessions conserva NULL cuando no hay dato válido.
+- Los campos decimales (promedio, porcentaje, inactividad) siguen manteniendo
+  sus decimales.
+- No requiere cambios en Supabase ni migración SQL.
+- Se conserva la lógica v1.8: una actividad con 0 por no entrega NO se cuenta
+  como completada y sí puede elevar el riesgo del estudiante.

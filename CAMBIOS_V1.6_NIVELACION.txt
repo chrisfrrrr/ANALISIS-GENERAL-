@@ -1,0 +1,16 @@
+VERSIÓN 1.6 – CORRECCIÓN DE ANÁLISIS SEMANAL
+
+Problema corregido:
+- La consulta de Page Views se realizaba estudiante por estudiante. En secciones grandes podía tardar demasiado y Streamlit podía finalizar o reiniciar la ejecución antes de mostrar resultados.
+
+Cambios:
+- Page Views ahora se consulta en paralelo con hasta 8 trabajadores.
+- Tiempo de espera reducido por estudiante.
+- Máximo de 5 páginas de vistas por estudiante para la estimación semanal.
+- Los errores o permisos faltantes de Page Views ya no detienen el análisis principal.
+- Advertencia visible cuando Page Views está activado.
+- El análisis normal de inscripciones, actividades, entregas, riesgo e historial se conserva sin cambios.
+
+Recomendación:
+- Para máxima velocidad, mantener Page Views apagado.
+- Activarlo únicamente cuando sea necesario estimar ingresos a Canvas.

@@ -1,0 +1,57 @@
+AVE ALERTA TEMPRANA — V2.0 DERIVACIÓN UNIFICADA DE DOS CURSOS
+
+OBJETIVO
+Agregar una variante de derivación que consolida dos cursos en un solo expediente por estudiante, sin alterar la derivación individual existente.
+
+NUEVA PÁGINA
+Intervenciones > Derivación unificada
+
+FUNCIONALIDAD
+1. Permite seleccionar exactamente dos cursos.
+2. Permite seleccionar una o varias secciones de cada curso mediante multiselección.
+3. Permite definir módulo y semana de análisis de forma independiente para cada curso.
+4. Usa una fecha de corte común.
+5. En Canvas real, cada curso se analiza una sola vez aunque se seleccionen varias secciones.
+6. Consolida por estudiante usando el Canvas User ID como identidad principal.
+7. Conserva estudiantes que aparezcan solo en uno de los cursos y marca el otro como “No aparece en el curso”.
+8. Conserva la asesora/or de bienestar asignada.
+9. Si se detectan asesores diferentes entre cursos, marca el caso para revisión.
+10. Riesgo consolidado = nivel de riesgo más alto encontrado entre los dos cursos.
+11. Prioridad consolidada = prioridad más alta encontrada entre los dos cursos.
+
+INDICADORES CONSOLIDADOS
+- Pendientes Curso 1
+- Pendientes Curso 2
+- Pendientes total = C1 + C2
+- Horas de desconexión Curso 1
+- Horas de desconexión Curso 2
+- Suma referencial de desconexión = C1 + C2
+- Actividades esperadas acumuladas
+- Actividades completadas acumuladas
+- Avance acumulado
+- Promedio combinado
+- Cursos en los que aparece el estudiante
+
+DERIVACIÓN
+Solo se habilitan como elegibles los estudiantes cuyo riesgo consolidado sea Moderado o Alto.
+
+PAQUETE ZIP
+Se genera una carpeta por asesora/or de bienestar que contiene:
+- Informe_unificado.xlsx: una fila por estudiante, con detalle de ambos cursos y totales.
+- Derivacion_Unificada_<carne>_<nombre>.xlsx: un único expediente por estudiante.
+
+Cada expediente individual contiene:
+- Hoja “Derivación unificada” con indicadores globales.
+- Hoja “Detalle por curso” con los valores individuales de los dos cursos.
+- Hoja “Actividades pendientes” con el listado de pendientes separado por curso.
+
+BASE DE DATOS
+La derivación unificada reutiliza las tablas existentes de referral_batches y referrals, por lo que no requiere migración SQL adicional.
+
+COMPATIBILIDAD
+- La página de Derivaciones original se conserva sin cambios.
+- El análisis semanal individual se conserva.
+- Se amplió AnalysisService para aceptar varias secciones del mismo curso en una sola ejecución.
+
+VALIDACIÓN
+Suite completa ejecutada: 32 pruebas superadas.

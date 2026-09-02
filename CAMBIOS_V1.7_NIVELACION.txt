@@ -1,0 +1,8 @@
+VERSIÓN 1.7 — DETALLE COMPLETO DE ACTIVIDADES PENDIENTES
+
+- El expediente individual muestra todas las actividades pendientes, sin resumirlas con “y X más”.
+- Las razones del motor de riesgo incluyen la lista completa de pendientes.
+- Los mensajes académicos incluyen todos los nombres de actividades pendientes.
+- El informe consolidado de derivaciones ya no limita la razón resumida a 500 caracteres.
+- Cada informe consolidado incorpora una hoja “Detalle pendientes” con una fila por actividad y estudiante.
+- Cada derivación individual incorpora una hoja “Actividades pendientes” con el listado completo numerado.

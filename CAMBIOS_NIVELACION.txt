@@ -1,0 +1,10 @@
+VERSIÓN PARALELA — NIVELACIÓN 3x7
+
+- Se reemplazó la estructura fija de 5 semanas por 3 módulos de 7 semanas.
+- La selección del corte ahora separa Módulo y Semana del módulo.
+- El plan semanal muestra etiquetas por módulo y semana.
+- Internamente se conservan semanas globales 1 a 21 para mantener el motor original.
+- Se actualizaron mensajes, derivaciones, métricas y configuración.
+- Se añadió migración SQL para ampliar restricciones de Supabase de 1–5 a 1–21.
+- La configuración de esta app paralela queda fijada a 21 semanas aunque exista una configuración antigua.
+- Se conserva el resto de las funciones de la aplicación original.

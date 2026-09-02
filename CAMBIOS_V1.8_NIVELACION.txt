@@ -1,0 +1,15 @@
+VERSIÓN 1.8 - CORRECCIÓN DE CEROS POR NO ENTREGA
+
+Problema corregido:
+Canvas puede mostrar workflow_state="graded" cuando el docente asigna 0 a una actividad no entregada. La versión anterior interpretaba cualquier estado "graded" como actividad completada.
+
+Nueva regla:
+- Una calificación 0 por ausencia NO cuenta como entrega ni como actividad completada.
+- Si Canvas marca missing=true, la actividad se considera pendiente aunque esté calificada.
+- Un estado graded por sí solo ya no demuestra entrega.
+- Una entrega real con score=0 sí cuenta como completada si existe submitted_at o evidencia de intento real.
+- Las actividades excusadas continúan considerándose satisfechas.
+- El 0 continúa formando parte de la información de calificación/promedio; solo se corrige el conteo de avance y riesgo.
+
+Impacto:
+Los estudiantes con actividades calificadas en 0 por falta de entrega ahora aparecen con esas actividades como pendientes, su porcentaje de avance disminuye correctamente y el motor de riesgo puede clasificarlos según la brecha real.
