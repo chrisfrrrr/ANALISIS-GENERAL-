@@ -1,0 +1,38 @@
+AVE ALERTA TEMPRANA — V2.1
+AGRUPACIÓN DE SECCIONES CREADAS COMO CURSOS CANVAS
+
+Problema corregido
+------------------
+En algunas implementaciones de Canvas cada sección académica está creada como un
+curso independiente. Ejemplo:
+
+- ÁLGEBRA SUPERIOR - SECCIÓN - 10 - 2026 - 1
+- ÁLGEBRA SUPERIOR - SECCIÓN - 11 - 2026 - 1
+- ÁLGEBRA SUPERIOR - SECCIÓN - 12 - 2026 - 1
+
+La V2.0 seleccionaba uno de esos course_id como "Curso 1" y luego intentaba
+consultar secciones internas dentro de ese course_id. Por eso el multiselect podía
+aparecer vacío y no mostraba las demás secciones de la misma materia.
+
+Cambios V2.1
+------------
+1. Se agregó detección automática de familias de cursos por materia y periodo.
+2. Los course_id que siguen el patrón "MATERIA - SECCIÓN - XX - AÑO - PERIODO"
+   se agrupan como una sola materia lógica.
+3. El selector principal ahora muestra la materia, por ejemplo:
+   "ÁLGEBRA SUPERIOR · 2026-1 · 3 secciones Canvas".
+4. El multiselect muestra cada course_id relacionado como una sección elegible.
+5. Se pueden seleccionar simultáneamente las secciones 10, 11, 12, etc.
+6. Cada course_id seleccionado se analiza con sus propias actividades y alumnos.
+7. Antes de consolidar, los resultados se vuelven a identificar bajo la misma
+   materia lógica para producir una sola fila por estudiante por materia.
+8. Se conserva el detalle de la sección real del estudiante.
+9. Continúa funcionando con cursos Canvas tradicionales que sí contienen secciones
+   internas dentro de un único course_id.
+10. Si Canvas no expone secciones internas, la aplicación ofrece "Curso completo"
+    en lugar de dejar el selector vacío.
+
+Validación
+----------
+Suite automatizada: 35 pruebas superadas.
+Se incluyeron pruebas específicas de agrupación por materia, sección y periodo.

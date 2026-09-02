@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from services.combined_referral_service import combine_course_analyses, generate
 from services.database_service import DatabaseError
 from services.demo_service import demo_courses, demo_sections, generate_demo_analysis
 from services.runtime import get_database
+from utils.course_families import family_option_label, group_course_families, shell_option_label
 from utils.course_structure import MODULE_COUNT, WEEKS_PER_MODULE, global_week, period_label
 from utils.data_cleaning import load_wellbeing_csv, merge_wellbeing
 
@@ -23,7 +25,7 @@ WELLBEING_PATH = ROOT / "data" / "bienestar_base.csv"
 
 page_header(
     "Derivación unificada · dos cursos",
-    "Seleccione un par de cursos y las secciones de cada uno. La app consolida por estudiante pendientes, desconexión y riesgo, conservando el detalle individual de ambos cursos.",
+    "Seleccione dos materias y luego las secciones Canvas que desea incluir. La app reconoce cuando cada sección fue creada como un curso independiente y consolida todo por estudiante.",
 )
 
 config = RiskConfig.from_dict(st.session_state.get("risk_config"))
@@ -39,31 +41,34 @@ if not demo_mode:
         token = st.session_state.get("canvas_token", "")
 
 courses = st.session_state.get("courses") or (demo_courses() if demo_mode else [])
-if len(courses) < 2:
+families = group_course_families(courses)
+if len(families) < 2:
     empty_state(
-        "Se necesitan al menos dos cursos",
+        "Se necesitan al menos dos materias",
         "Cargue los cursos desde Conexión y análisis antes de preparar una derivación unificada.",
     )
     st.stop()
 
-course_labels = {
-    f"{course.get('name') or course.get('course_code')} · ID {course.get('id')}": course
-    for course in courses
-}
-labels = list(course_labels.keys())
+family_labels = {family_option_label(family): family for family in families}
+family_label_list = list(family_labels.keys())
 
-st.subheader("1. Seleccione los dos cursos")
+st.subheader("1. Seleccione las dos materias")
 c1, c2 = st.columns(2)
 with c1:
-    label_1 = st.selectbox("Curso 1", labels, key="combined_course_1")
-    course_1 = course_labels[label_1]
+    label_1 = st.selectbox("Curso 1", family_label_list, key="combined_family_1")
+    family_1 = family_labels[label_1]
 with c2:
-    remaining_labels = [label for label in labels if label != label_1]
-    label_2 = st.selectbox("Curso 2", remaining_labels, key="combined_course_2")
-    course_2 = course_labels[label_2]
+    remaining_labels = [label for label in family_label_list if label != label_1]
+    label_2 = st.selectbox("Curso 2", remaining_labels, key="combined_family_2")
+    family_2 = family_labels[label_2]
+
+# Estos objetos representan la materia lógica. Sus secciones pueden estar
+# distribuidas en varios course_id de Canvas.
+course_1 = {"id": family_1["id"], "name": family_1["name"], "course_code": family_1["base_name"]}
+course_2 = {"id": family_2["id"], "name": family_2["name"], "course_code": family_2["base_name"]}
 
 
-def get_sections(course: dict) -> list[dict]:
+def get_internal_sections(course: dict) -> list[dict]:
     key = f"sections_{course['id']}_{'demo' if demo_mode else 'real'}"
     if key not in st.session_state:
         if demo_mode:
@@ -74,45 +79,105 @@ def get_sections(course: dict) -> list[dict]:
     return st.session_state.get(key, [])
 
 
-try:
-    sections_1 = get_sections(course_1)
-    sections_2 = get_sections(course_2)
-except CanvasAPIError as exc:
-    st.error(f"No fue posible cargar las secciones: {exc}")
-    st.stop()
+def family_sources(family: dict) -> list[dict]:
+    """Devuelve opciones seleccionables, sean course shells o secciones internas."""
+    shells = family.get("courses") or []
+    use_shells_as_sections = bool(family.get("section_shells")) or len(shells) > 1
+    sources: list[dict] = []
+
+    if use_shells_as_sections:
+        for shell in shells:
+            info = shell.get("_family_info") or {}
+            section_name = info.get("section_label") or shell.get("name") or "Sección"
+            sources.append(
+                {
+                    "id": f"course:{shell.get('id')}",
+                    "selection_key": f"course:{shell.get('id')}",
+                    "label": shell_option_label(shell),
+                    "course": shell,
+                    "canvas_section_id": None,
+                    "section_name": section_name,
+                    "source_type": "course_shell",
+                }
+            )
+        return sources
+
+    # Compatibilidad con cursos Canvas tradicionales que sí contienen varias
+    # secciones internas dentro de un único course_id.
+    if not shells:
+        return []
+    shell = shells[0]
+    try:
+        internal = get_internal_sections(shell)
+    except CanvasAPIError:
+        internal = []
+
+    if internal:
+        for section in internal:
+            if section.get("id") is None:
+                continue
+            section_name = section.get("name") or "Sección"
+            students = section.get("total_students")
+            students_text = "—" if students in (None, "") else str(students)
+            sources.append(
+                {
+                    "id": f"section:{shell.get('id')}:{section.get('id')}",
+                    "selection_key": f"section:{shell.get('id')}:{section.get('id')}",
+                    "label": f"{section_name} · {students_text} estudiantes · ID {section.get('id')}",
+                    "course": shell,
+                    "canvas_section_id": section.get("id"),
+                    "section_name": section_name,
+                    "source_type": "internal_section",
+                }
+            )
+    else:
+        # Si Canvas no expone secciones internas, todavía se permite analizar
+        # el curso completo en lugar de dejar el selector vacío.
+        sources.append(
+            {
+                "id": f"course:{shell.get('id')}",
+                "selection_key": f"course:{shell.get('id')}",
+                "label": f"Curso completo · ID {shell.get('id')}",
+                "course": shell,
+                "canvas_section_id": None,
+                "section_name": shell.get("name") or "Curso completo",
+                "source_type": "course_shell",
+            }
+        )
+    return sources
 
 
-def section_options(sections: list[dict]) -> dict[str, dict]:
-    return {
-        f"{item.get('name') or 'Sección'} ({item.get('total_students', '—')} estudiantes)": item
-        for item in sections
-        if item.get("id") is not None
-    }
+sources_1 = family_sources(family_1)
+sources_2 = family_sources(family_2)
+options_1 = {item["label"]: item for item in sources_1}
+options_2 = {item["label"]: item for item in sources_2}
 
-
-options_1 = section_options(sections_1)
-options_2 = section_options(sections_2)
-
-st.subheader("2. Elija cuántas secciones incluir de cada curso")
+st.subheader("2. Elija las secciones que desea incluir")
 s1, s2 = st.columns(2)
 with s1:
     selected_labels_1 = st.multiselect(
-        f"Secciones de {course_1.get('name')}",
+        f"Secciones de {family_1.get('name')}",
         list(options_1.keys()),
         default=list(options_1.keys()),
-        key=f"combined_sections_{course_1['id']}",
+        key=f"combined_family_sections_1_{family_1['key']}",
     )
     selected_sections_1 = [options_1[label] for label in selected_labels_1]
     st.caption(f"Se incluirán {len(selected_sections_1)} sección(es).")
 with s2:
     selected_labels_2 = st.multiselect(
-        f"Secciones de {course_2.get('name')}",
+        f"Secciones de {family_2.get('name')}",
         list(options_2.keys()),
         default=list(options_2.keys()),
-        key=f"combined_sections_{course_2['id']}",
+        key=f"combined_family_sections_2_{family_2['key']}",
     )
     selected_sections_2 = [options_2[label] for label in selected_labels_2]
     st.caption(f"Se incluirán {len(selected_sections_2)} sección(es).")
+
+if family_1.get("section_shells") or family_2.get("section_shells"):
+    st.info(
+        "La aplicación detectó que Canvas tiene secciones creadas como cursos independientes. "
+        "Por eso ahora las agrupa por materia y cada course_id aparece como una sección seleccionable."
+    )
 
 st.subheader("3. Defina el corte de cada curso")
 w1, w2, cutoff_col = st.columns([1.55, 1.55, 1.1])
@@ -157,12 +222,16 @@ def activity_plan_for(course_id: int | str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def source_signature(items: list[dict]) -> tuple[str, ...]:
+    return tuple(sorted(str(item["selection_key"]) for item in items))
+
+
 current_signature = (
     str(course_1["id"]),
-    tuple(sorted(str(item["id"]) for item in selected_sections_1)),
+    source_signature(selected_sections_1),
     int(week_1),
     str(course_2["id"]),
-    tuple(sorted(str(item["id"]) for item in selected_sections_2)),
+    source_signature(selected_sections_2),
     int(week_2),
     analysis_date.isoformat(),
     bool(include_page_views),
@@ -181,77 +250,124 @@ if st.button(
 ):
     progress = st.progress(0, text="Preparando análisis combinado...")
 
-    def scaled_progress(course_number: int, label: str, value: float) -> None:
-        base = 0.0 if course_number == 1 else 0.5
-        progress.progress(min(0.99, base + 0.48 * min(max(value, 0.0), 1.0)), text=f"Curso {course_number}: {label}")
-
     try:
         latest_messages = db.get_latest_messages() if db.connected else pd.DataFrame()
         wellbeing = load_wellbeing_csv(WELLBEING_PATH)
         frames: list[pd.DataFrame] = []
         diagnostics: list[dict] = []
 
-        for slot, (course, selected_sections, week) in enumerate(
+        for slot, (logical_course, selected_sources, week) in enumerate(
             [(course_1, selected_sections_1, week_1), (course_2, selected_sections_2, week_2)],
             start=1,
         ):
-            section_ids = [item["id"] for item in selected_sections]
-            section_name_map = {str(item["id"]): item.get("name") or "Sección" for item in selected_sections}
+            # Agrupar por course_id real permite consultar una sola vez un curso
+            # que tenga varias secciones internas, pero mantiene llamadas separadas
+            # cuando Canvas creó cada sección como un curso distinto.
+            by_actual_course: dict[str, list[dict]] = defaultdict(list)
+            for source in selected_sources:
+                by_actual_course[str(source["course"]["id"])].append(source)
 
-            if demo_mode:
-                demo_frames = []
-                demo_diagnostics = []
-                for index, section in enumerate(selected_sections, start=1):
-                    progress.progress(
-                        (0.0 if slot == 1 else 0.5) + 0.48 * index / max(len(selected_sections), 1),
-                        text=f"Curso {slot}: generando {section.get('name')}",
+            slot_frames: list[pd.DataFrame] = []
+            slot_diags: list[dict] = []
+            actual_groups = list(by_actual_course.values())
+
+            for group_index, source_group in enumerate(actual_groups, start=1):
+                actual_course = source_group[0]["course"]
+                unit_base = 0.0 if slot == 1 else 0.5
+                unit_span = 0.48 / max(len(actual_groups), 1)
+
+                def unit_progress(label: str, value: float, *, idx=group_index, base=unit_base, span=unit_span, n=slot) -> None:
+                    absolute = base + span * ((idx - 1) + min(max(value, 0.0), 1.0))
+                    progress.progress(min(0.99, absolute), text=f"Curso {n}: {label}")
+
+                internal_ids = [
+                    item["canvas_section_id"]
+                    for item in source_group
+                    if item.get("canvas_section_id") is not None
+                ]
+                section_name_map = {
+                    str(item["canvas_section_id"]): item["section_name"]
+                    for item in source_group
+                    if item.get("canvas_section_id") is not None
+                }
+                fallback_section_name = source_group[0]["section_name"]
+
+                if demo_mode:
+                    demo_frames: list[pd.DataFrame] = []
+                    demo_diags: list[dict] = []
+                    for source_index, source in enumerate(source_group, start=1):
+                        unit_progress(
+                            f"generando {source.get('section_name')}",
+                            source_index / max(len(source_group), 1),
+                        )
+                        frame, _detail, diag = generate_demo_analysis(
+                            course=actual_course,
+                            section_id=source.get("canvas_section_id"),
+                            section_name=source.get("section_name") or "Sección",
+                            week=week,
+                            analysis_date=analysis_date,
+                            config=config,
+                            wellbeing_path=WELLBEING_PATH,
+                        )
+                        demo_frames.append(frame)
+                        demo_diags.append(diag)
+                    dataframe = pd.concat(demo_frames, ignore_index=True) if demo_frames else pd.DataFrame()
+                    diag = {
+                        "course_id": str(actual_course["id"]),
+                        "course_name": actual_course.get("name"),
+                        "students": len(dataframe),
+                        "demo": True,
+                        "section_diagnostics": demo_diags,
+                    }
+                else:
+                    previous_history = (
+                        db.get_snapshot_history(course_id=actual_course["id"], limit=5000)
+                        if db.connected
+                        else pd.DataFrame()
                     )
-                    frame, _detail, diag = generate_demo_analysis(
-                        course=course,
-                        section_id=section["id"],
-                        section_name=section.get("name") or "Sección",
+                    canvas = CanvasService(canvas_url, token)
+                    service = AnalysisService(canvas, config)
+                    dataframe, _detail, diag = service.analyze_course(
+                        course=actual_course,
+                        section_id=None,
+                        section_name=fallback_section_name,
+                        section_ids=internal_ids or None,
+                        section_name_map=section_name_map or None,
                         week=week,
                         analysis_date=analysis_date,
-                        config=config,
-                        wellbeing_path=WELLBEING_PATH,
+                        include_page_views=include_page_views,
+                        include_zero_point=include_zero_point,
+                        latest_messages=latest_messages,
+                        previous_history=previous_history,
+                        activity_plan=activity_plan_for(actual_course["id"]),
+                        progress_callback=unit_progress,
                     )
-                    demo_frames.append(frame)
-                    demo_diagnostics.append(diag)
-                dataframe = pd.concat(demo_frames, ignore_index=True) if demo_frames else pd.DataFrame()
-                diag = {
-                    "course_id": str(course["id"]),
-                    "course_name": course.get("name"),
-                    "students": len(dataframe),
-                    "selected_sections": section_name_map,
-                    "demo": True,
-                    "section_diagnostics": demo_diagnostics,
-                }
-            else:
-                previous_history = (
-                    db.get_snapshot_history(course_id=course["id"], limit=5000) if db.connected else pd.DataFrame()
-                )
-                canvas = CanvasService(canvas_url, token)
-                service = AnalysisService(canvas, config)
-                dataframe, _detail, diag = service.analyze_course(
-                    course=course,
-                    section_id=None,
-                    section_name="Selección múltiple",
-                    section_ids=section_ids,
-                    section_name_map=section_name_map,
-                    week=week,
-                    analysis_date=analysis_date,
-                    include_page_views=include_page_views,
-                    include_zero_point=include_zero_point,
-                    latest_messages=latest_messages,
-                    previous_history=previous_history,
-                    activity_plan=activity_plan_for(course["id"]),
-                    progress_callback=lambda label, value, n=slot: scaled_progress(n, label, value),
-                )
-                dataframe = merge_wellbeing(dataframe, wellbeing)
-                dataframe["advisor_name"] = dataframe["asesor_bienestar"]
+                    dataframe = merge_wellbeing(dataframe, wellbeing)
+                    dataframe["advisor_name"] = dataframe["asesor_bienestar"]
 
-            frames.append(dataframe)
-            diagnostics.append(diag)
+                if not dataframe.empty:
+                    # Conservar trazabilidad del shell real, pero unificar la materia
+                    # para que combine_course_analyses produzca una sola fila por alumno.
+                    dataframe = dataframe.copy()
+                    dataframe["source_course_id"] = dataframe["course_id"].astype(str)
+                    dataframe["source_course_name"] = dataframe["course_name"]
+                    dataframe["course_id"] = str(logical_course["id"])
+                    dataframe["course_name"] = logical_course["name"]
+                    slot_frames.append(dataframe)
+                diag["logical_course_id"] = str(logical_course["id"])
+                diag["logical_course_name"] = logical_course["name"]
+                slot_diags.append(diag)
+
+            slot_dataframe = pd.concat(slot_frames, ignore_index=True) if slot_frames else pd.DataFrame()
+            frames.append(slot_dataframe)
+            diagnostics.append(
+                {
+                    "logical_course_id": str(logical_course["id"]),
+                    "logical_course_name": logical_course["name"],
+                    "selected_sources": [item["selection_key"] for item in selected_sources],
+                    "source_diagnostics": slot_diags,
+                }
+            )
 
         raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         combined = combine_course_analyses(raw, [course_1, course_2])
@@ -266,7 +382,8 @@ if st.button(
         progress.empty()
         st.success(
             f"Análisis completado: {len(combined)} estudiante(s) únicos entre los dos cursos. "
-            f"Se revisaron {len(selected_sections_1)} sección(es) del Curso 1 y {len(selected_sections_2)} del Curso 2."
+            f"Se revisaron {len(selected_sections_1)} sección(es) de {family_1['base_name']} y "
+            f"{len(selected_sections_2)} sección(es) de {family_2['base_name']}."
         )
     except (CanvasAPIError, DatabaseError, ValueError) as exc:
         progress.empty()
