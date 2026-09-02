@@ -100,6 +100,9 @@ def _course_payload(row: dict[str, Any] | None, course: dict[str, Any]) -> dict[
             "completion_percentage": 0.0,
             "pending_assignments": [],
             "last_activity_at": None,
+            "inactivity_reference_at": None,
+            "inactivity_estimated": False,
+            "inactivity_source": "Sin datos",
             "reasons": [],
         }
     return {
@@ -118,6 +121,9 @@ def _course_payload(row: dict[str, Any] | None, course: dict[str, Any]) -> dict[
         "completion_percentage": round(_number(row.get("completion_percentage")), 2),
         "pending_assignments": _as_list(row.get("pending_assignments")),
         "last_activity_at": row.get("last_activity_at"),
+        "inactivity_reference_at": row.get("inactivity_reference_at"),
+        "inactivity_estimated": bool(row.get("inactivity_estimated") or False),
+        "inactivity_source": row.get("inactivity_source") or "Última actividad reportada por Canvas",
         "reasons": _as_list(row.get("reasons")),
     }
 
@@ -207,6 +213,9 @@ def combine_course_analyses(
                 "course_1_completion": c1["completion_percentage"],
                 "course_1_pending_assignments": c1["pending_assignments"],
                 "course_1_last_activity_at": c1["last_activity_at"],
+                "course_1_inactivity_reference_at": c1["inactivity_reference_at"],
+                "course_1_inactivity_estimated": c1["inactivity_estimated"],
+                "course_1_inactivity_source": c1["inactivity_source"],
                 "course_1_reasons": c1["reasons"],
                 "course_2_id": c2["course_id"],
                 "course_2_name": c2["course_name"],
@@ -222,6 +231,9 @@ def combine_course_analyses(
                 "course_2_completion": c2["completion_percentage"],
                 "course_2_pending_assignments": c2["pending_assignments"],
                 "course_2_last_activity_at": c2["last_activity_at"],
+                "course_2_inactivity_reference_at": c2["inactivity_reference_at"],
+                "course_2_inactivity_estimated": c2["inactivity_estimated"],
+                "course_2_inactivity_source": c2["inactivity_source"],
                 "course_2_reasons": c2["reasons"],
             }
         )
@@ -251,7 +263,8 @@ def build_combined_reason(row: dict[str, Any]) -> str:
             continue
         text = f"{course} ({section}): {pending} pendiente(s), riesgo {risk}"
         if not _missing(inactivity):
-            text += f" e inactividad de {float(inactivity):.1f} horas"
+            qualifier = " estimada" if bool(row.get(f"course_{idx}_inactivity_estimated")) else ""
+            text += f" e inactividad{qualifier} de {float(inactivity):.1f} horas"
         parts.append(text + ".")
     if not _missing(row.get("inactivity_total_hours")):
         parts.append(
@@ -292,6 +305,7 @@ def _add_course_detail_sheet(wb: Workbook, row: dict[str, Any]) -> None:
     headers = [
         "Curso", "Sección", "Semana", "Riesgo", "Prioridad", "Esperadas", "Completadas",
         "Pendientes", "Inactividad (h)", "Promedio (%)", "Avance (%)", "Última actividad",
+        "Origen de desconexión", "Referencia del cálculo",
     ]
     for col, header in enumerate(headers, 1):
         cell = ws.cell(1, col, header)
@@ -304,13 +318,15 @@ def _add_course_detail_sheet(wb: Workbook, row: dict[str, Any]) -> None:
             row.get(f"course_{idx}_name"), row.get(f"course_{idx}_section"), row.get(f"course_{idx}_week"),
             row.get(f"course_{idx}_risk"), row.get(f"course_{idx}_priority"), row.get(f"course_{idx}_expected"),
             row.get(f"course_{idx}_completed"), row.get(f"course_{idx}_pending"), row.get(f"course_{idx}_inactivity_hours"),
-            row.get(f"course_{idx}_average"), row.get(f"course_{idx}_completion"), row.get(f"course_{idx}_last_activity_at"),
+            row.get(f"course_{idx}_average"), row.get(f"course_{idx}_completion"),
+            row.get(f"course_{idx}_last_activity_at") or ("Sin actividad registrada" if row.get(f"course_{idx}_inactivity_estimated") else None),
+            row.get(f"course_{idx}_inactivity_source"), row.get(f"course_{idx}_inactivity_reference_at"),
         ]
         for col, value in enumerate(values, 1):
             cell = ws.cell(idx + 1, col, value)
             cell.border = BORDER
             cell.alignment = Alignment(vertical="top", wrap_text=True)
-    widths = [38, 24, 10, 12, 14, 11, 12, 11, 16, 14, 13, 25]
+    widths = [38, 24, 10, 12, 14, 11, 12, 11, 16, 14, 13, 25, 38, 26]
     for i, width in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.freeze_panes = "A2"

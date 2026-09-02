@@ -330,6 +330,7 @@ if st.button(
                     }
                 else:
                     cache_key = (
+                        "v5-inactivity-fallback",
                         str(actual_course["id"]),
                         tuple(sorted(str(value) for value in internal_ids)),
                         int(week),
@@ -425,6 +426,16 @@ if st.button(
             f"Se revisaron {len(selected_sections_1)} sección(es) de {family_1['base_name']} y "
             f"{len(selected_sections_2)} sección(es) de {family_2['base_name']}."
         )
+        estimated_inactivity = int(
+            raw.get("inactivity_estimated", pd.Series(False, index=raw.index)).fillna(False).astype(bool).sum()
+        ) if not raw.empty else 0
+        if estimated_inactivity:
+            st.info(
+                f"Canvas no reportó una última actividad para {estimated_inactivity} registro(s). "
+                "En esos casos la desconexión se calculó desde la última asistencia disponible o, "
+                "si nunca hubo actividad, desde el inicio efectivo del curso/matrícula. "
+                "El Excel identifica estos valores como estimados."
+            )
         if include_page_views and page_view_omissions:
             st.warning(
                 f"Canvas protegió o limitó Page Views para {page_view_omissions} consulta(s). "

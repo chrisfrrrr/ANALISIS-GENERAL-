@@ -348,6 +348,77 @@ class AnalysisService:
         return start, end
 
     @staticmethod
+    def _resolve_inactivity(
+        enrollment: dict[str, Any],
+        course: dict[str, Any],
+        cutoff_dt: datetime,
+        week: int,
+    ) -> dict[str, Any]:
+        """Resuelve la desconexión incluso cuando Canvas no reporta last_activity_at.
+
+        Canvas permite que ``last_activity_at`` sea nulo, especialmente cuando el
+        estudiante nunca ha navegado por ese curso. Dejarlo como nulo ocultaba
+        precisamente a estudiantes de alto riesgo. La jerarquía es:
+
+        1. última actividad real de Canvas;
+        2. última asistencia registrada, si existe;
+        3. fecha efectiva en la que el estudiante pudo comenzar (matrícula/curso/
+           período);
+        4. estimación conservadora desde el inicio de la semana 1 según el corte.
+
+        Los respaldos 2-4 se marcan como estimados para no presentarlos como una
+        actividad real del estudiante.
+        """
+        last_activity = enrollment.get("last_activity_at")
+        if parse_datetime(last_activity):
+            return {
+                "last_activity_at": last_activity,
+                "inactivity_reference_at": last_activity,
+                "inactivity_hours": hours_between(last_activity, cutoff_dt),
+                "inactivity_estimated": False,
+                "inactivity_source": "Última actividad reportada por Canvas",
+            }
+
+        last_attended = enrollment.get("last_attended_at")
+        if parse_datetime(last_attended):
+            return {
+                "last_activity_at": None,
+                "inactivity_reference_at": last_attended,
+                "inactivity_hours": hours_between(last_attended, cutoff_dt),
+                "inactivity_estimated": True,
+                "inactivity_source": "Última asistencia registrada en Canvas",
+            }
+
+        term = course.get("term") or {}
+        start_candidates: list[tuple[str, datetime]] = []
+        for label, raw_value in (
+            ("Inicio de matrícula", enrollment.get("start_at")),
+            ("Inicio del curso", course.get("start_at")),
+            ("Inicio del período", term.get("start_at") if isinstance(term, dict) else None),
+            ("Creación de matrícula", enrollment.get("created_at")),
+        ):
+            parsed = parse_datetime(raw_value)
+            if parsed and parsed <= cutoff_dt:
+                start_candidates.append((label, parsed))
+
+        if start_candidates:
+            # El acceso real no puede comenzar antes de que matrícula, curso y
+            # período estén disponibles. La fecha más reciente evita sobrestimar.
+            source, reference = max(start_candidates, key=lambda item: item[1])
+        else:
+            safe_week = max(1, int(week or 1))
+            reference = cutoff_dt - timedelta(days=7 * safe_week)
+            source = "Inicio estimado del curso según la semana analizada"
+
+        return {
+            "last_activity_at": None,
+            "inactivity_reference_at": reference.isoformat(),
+            "inactivity_hours": hours_between(reference, cutoff_dt),
+            "inactivity_estimated": True,
+            "inactivity_source": f"Sin actividad registrada · {source}",
+        }
+
+    @staticmethod
     def _message_map(messages: pd.DataFrame) -> dict[tuple[str, str], dict[str, Any]]:
         if messages.empty:
             return {}
@@ -619,8 +690,9 @@ class AnalysisService:
             if average is None:
                 average = self._grade_from_submissions(expected_set, student_submissions)
 
-            last_activity = enrollment.get("last_activity_at")
-            inactivity_hours = hours_between(last_activity, cutoff_dt)
+            inactivity = self._resolve_inactivity(enrollment, course, cutoff_dt, week)
+            last_activity = inactivity["last_activity_at"]
+            inactivity_hours = inactivity["inactivity_hours"]
             weekly_sessions = sessions_map.get(canvas_user_id) if include_page_views else None
 
             latest_message = messages_map.get((canvas_user_id, str(course_id)))
@@ -719,6 +791,9 @@ class AnalysisService:
                 "weekly_sessions": weekly_sessions,
                 "inactivity_hours": round(inactivity_hours, 1) if inactivity_hours is not None else None,
                 "last_activity_at": last_activity,
+                "inactivity_reference_at": inactivity.get("inactivity_reference_at"),
+                "inactivity_estimated": bool(inactivity.get("inactivity_estimated")),
+                "inactivity_source": inactivity.get("inactivity_source"),
                 "activity_risk": activity_indicator.risk,
                 "grade_risk": grade_indicator.risk,
                 "punctuality_risk": punctuality_indicator.risk,
