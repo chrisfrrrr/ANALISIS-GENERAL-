@@ -1,0 +1,33 @@
+AVE ALERTA TEMPRANA — V2.3 / Derivación unificada V5
+Corrección de desconexión cuando Canvas no reporta last_activity_at
+
+Problema corregido
+------------------
+Canvas puede devolver last_activity_at = null para estudiantes que nunca han navegado
+por un curso o cuya actividad no quedó registrada por ese indicador. En la derivación
+unificada esto dejaba vacía la columna Desconexión C1/C2 aunque el estudiante sí tuviera
+actividades pendientes.
+
+Nueva lógica
+------------
+1. Usa last_activity_at cuando Canvas lo reporta: valor real.
+2. Si no existe, usa last_attended_at cuando esté disponible: valor estimado.
+3. Si tampoco existe, calcula la desconexión desde la fecha efectiva más reciente entre:
+   - inicio de matrícula del estudiante;
+   - inicio del curso;
+   - inicio del período;
+   - creación de la matrícula.
+4. Si Canvas no entrega ninguna de esas fechas, usa un respaldo conservador según la
+   semana de análisis, evitando que la celda quede vacía.
+
+Trazabilidad
+------------
+- Los valores de respaldo se marcan internamente como inactivity_estimated.
+- El detalle individual agrega "Origen de desconexión" y "Referencia del cálculo".
+- La razón consolidada indica "inactividad estimada" cuando corresponde.
+- La pantalla informa cuántos registros necesitaron estimación.
+- Se cambió la firma de caché para no reutilizar resultados V4 con desconexiones vacías.
+
+Validación
+----------
+40 pruebas automatizadas superadas.
