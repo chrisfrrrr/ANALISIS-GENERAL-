@@ -1,0 +1,21 @@
+AVE ALERTA TEMPRANA - V2.2
+PROTECCIÓN CONTRA LÍMITE DE CONSULTAS DE CANVAS (HTTP 429)
+
+Cambios principales:
+1. Reintento automático de solicitudes GET cuando Canvas responde HTTP 429.
+2. Respeto de Retry-After cuando Canvas lo informa.
+3. Espera progresiva automática cuando no existe Retry-After.
+4. Coordinación de todas las consultas que utilizan el mismo token para evitar ráfagas concurrentes.
+5. Lectura de X-Rate-Limit-Remaining y reducción preventiva de velocidad cuando el cupo baja.
+6. Page Views dejó de ejecutarse de forma masivamente paralela.
+7. Si Page Views encuentra 429, 401 o 403, se detiene únicamente Page Views y el análisis principal continúa.
+8. Las horas de desconexión continúan calculándose con last_activity_at; no dependen de Page Views.
+9. Page Views se limita a un máximo de 2 páginas por estudiante para reducir costo API.
+10. Caché temporal de 10 minutos por curso/sección/corte en la derivación unificada.
+    Si una ejecución se interrumpe después de analizar varias secciones, al reintentar se reutilizan las ya completadas.
+11. Se utiliza una misma instancia de CanvasService durante el análisis unificado de ambos cursos.
+12. Mensaje informativo cuando algunas consultas Page Views fueron omitidas, sin marcar el análisis como fallido.
+
+Validación:
+- 37 pruebas automatizadas superadas.
+- Compilación de canvas_service.py, analysis_service.py y derivaciones_unificadas.py verificada.

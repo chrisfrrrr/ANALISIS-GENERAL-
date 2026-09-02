@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
+import threading
+import time
 from typing import Any, Callable, Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
 import requests
@@ -13,6 +15,17 @@ from urllib3.util.retry import Retry
 
 class CanvasAPIError(RuntimeError):
     """Error legible para el usuario al consultar la API de Canvas."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 @dataclass(slots=True)
@@ -31,49 +44,121 @@ def _chunks(values: Sequence[str], size: int) -> list[list[str]]:
 class CanvasService:
     """Cliente robusto para la API REST de Canvas.
 
-    Las consultas de lectura se reintentan automáticamente y las entregas se
-    solicitan en lotes pequeños para evitar respuestas demasiado pesadas.
+    Además de reintentar errores transitorios, coordina las llamadas que usan el
+    mismo token para evitar que varios hilos consuman simultáneamente el límite
+    dinámico de Canvas. Esto es especialmente importante al consultar Page Views.
     """
+
+    _registry_lock = threading.Lock()
+    _scope_locks: dict[str, threading.RLock] = {}
+    _rate_state: dict[str, dict[str, float | None]] = {}
 
     def __init__(
         self,
         base_url: str,
         token: str,
         timeout: int | tuple[int, int] = (15, 120),
+        *,
+        rate_limit_retries: int = 5,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token.strip()
         self.timeout = timeout
+        self.rate_limit_retries = max(0, int(rate_limit_retries))
         self.session = requests.Session()
         self.session.headers.update(
             {
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
-                "User-Agent": "AVE-Alerta-Temprana/1.3",
+                "User-Agent": "AVE-Alerta-Temprana/2.2",
             }
         )
 
-        # Solo se reintentan operaciones idempotentes. Los mensajes POST no se
-        # reintentan para evitar envíos duplicados.
+        # Los reintentos de estado HTTP se manejan manualmente para poder respetar
+        # el 429 de Canvas y compartir el tiempo de enfriamiento entre instancias.
         retry_policy = Retry(
-            total=3,
-            connect=3,
-            read=3,
-            status=3,
-            backoff_factor=1.0,
-            status_forcelist=(429, 500, 502, 503, 504),
+            total=2,
+            connect=2,
+            read=2,
+            status=0,
+            backoff_factor=0.5,
             allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
-            respect_retry_after_header=True,
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry_policy, pool_connections=20, pool_maxsize=20)
+        adapter = HTTPAdapter(max_retries=retry_policy, pool_connections=12, pool_maxsize=12)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+
+        scope_material = f"{self.base_url}|{self.token}".encode("utf-8", errors="ignore")
+        self._rate_scope = sha256(scope_material).hexdigest()
+        with self._registry_lock:
+            self._rate_lock = self._scope_locks.setdefault(self._rate_scope, threading.RLock())
+            self._rate_state.setdefault(
+                self._rate_scope,
+                {"next_request_at": 0.0, "remaining": None, "request_cost": None},
+            )
 
     def _url(self, path: str) -> str:
         if path.startswith("http"):
             return path
         return urljoin(f"{self.base_url}/", path.lstrip("/"))
+
+    @staticmethod
+    def _header_float(value: Any) -> float | None:
+        try:
+            if value in (None, ""):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _retry_after_seconds(value: Any) -> float | None:
+        seconds = CanvasService._header_float(value)
+        if seconds is None:
+            return None
+        return max(0.0, seconds)
+
+    @staticmethod
+    def _pacing_delay(remaining: float | None) -> float:
+        """Pequeña pausa preventiva según el presupuesto informado por Canvas."""
+        if remaining is None:
+            return 0.04
+        if remaining <= 5:
+            return 4.0
+        if remaining <= 10:
+            return 2.0
+        if remaining <= 20:
+            return 1.0
+        if remaining <= 40:
+            return 0.35
+        if remaining <= 80:
+            return 0.12
+        return 0.04
+
+    @property
+    def rate_limit_remaining(self) -> float | None:
+        with self._rate_lock:
+            return self._rate_state[self._rate_scope].get("remaining")
+
+    def _wait_for_shared_slot(self) -> None:
+        state = self._rate_state[self._rate_scope]
+        wait_seconds = max(0.0, float(state.get("next_request_at") or 0.0) - time.monotonic())
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+    def _observe_rate_headers(self, response: requests.Response) -> None:
+        state = self._rate_state[self._rate_scope]
+        remaining = self._header_float(response.headers.get("X-Rate-Limit-Remaining"))
+        request_cost = self._header_float(response.headers.get("X-Request-Cost"))
+        if remaining is not None:
+            state["remaining"] = remaining
+        if request_cost is not None:
+            state["request_cost"] = request_cost
+        state["next_request_at"] = max(
+            float(state.get("next_request_at") or 0.0),
+            time.monotonic() + self._pacing_delay(remaining),
+        )
 
     def _request(
         self,
@@ -84,36 +169,71 @@ class CanvasService:
         data: dict[str, Any] | list[tuple[str, Any]] | None = None,
         json: dict[str, Any] | None = None,
         timeout: int | tuple[int, int] | None = None,
+        rate_limit_retries: int | None = None,
     ) -> requests.Response:
         if not self.token:
             raise CanvasAPIError("Debe ingresar un token de Canvas.")
         if not self.base_url.startswith(("https://", "http://")):
             raise CanvasAPIError("La URL de Canvas no es válida.")
 
-        try:
-            response = self.session.request(
-                method,
-                self._url(path),
-                params=params,
-                data=data,
-                json=json,
-                timeout=timeout or self.timeout,
-            )
-        except requests.exceptions.ReadTimeout as exc:
-            raise CanvasAPIError(
-                "Canvas tardó demasiado en responder. La aplicación ya amplió el tiempo de espera y "
-                "reintenta automáticamente; vuelva a ejecutar el análisis o seleccione una sección específica."
-            ) from exc
-        except requests.exceptions.ConnectTimeout as exc:
-            raise CanvasAPIError(
-                "No fue posible establecer conexión con Canvas dentro del tiempo esperado. Intente nuevamente."
-            ) from exc
-        except requests.exceptions.ConnectionError as exc:
-            raise CanvasAPIError(
-                "No fue posible comunicarse con Canvas. Verifique la conexión a internet y vuelva a intentarlo."
-            ) from exc
-        except requests.RequestException as exc:
-            raise CanvasAPIError("Canvas no pudo completar la solicitud en este momento.") from exc
+        safe_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
+        allowed_429_retries = self.rate_limit_retries if rate_limit_retries is None else max(0, int(rate_limit_retries))
+        rate_attempts = 0
+        server_attempts = 0
+
+        while True:
+            # Todas las instancias con el mismo token comparten esta compuerta. Así
+            # Page Views no compite contra inscripciones/actividades/entregas.
+            with self._rate_lock:
+                self._wait_for_shared_slot()
+                try:
+                    response = self.session.request(
+                        method,
+                        self._url(path),
+                        params=params,
+                        data=data,
+                        json=json,
+                        timeout=timeout or self.timeout,
+                    )
+                except requests.exceptions.ReadTimeout as exc:
+                    raise CanvasAPIError(
+                        "Canvas tardó demasiado en responder. La aplicación amplió el tiempo de espera; "
+                        "vuelva a ejecutar el análisis si el problema persiste."
+                    ) from exc
+                except requests.exceptions.ConnectTimeout as exc:
+                    raise CanvasAPIError(
+                        "No fue posible establecer conexión con Canvas dentro del tiempo esperado. Intente nuevamente."
+                    ) from exc
+                except requests.exceptions.ConnectionError as exc:
+                    raise CanvasAPIError(
+                        "No fue posible comunicarse con Canvas. Verifique la conexión a internet y vuelva a intentarlo."
+                    ) from exc
+                except requests.RequestException as exc:
+                    raise CanvasAPIError("Canvas no pudo completar la solicitud en este momento.") from exc
+
+                self._observe_rate_headers(response)
+
+                if response.status_code == 429 and safe_method and rate_attempts < allowed_429_retries:
+                    retry_after = self._retry_after_seconds(response.headers.get("Retry-After"))
+                    # Si Canvas no especifica Retry-After, se usa espera exponencial.
+                    delay = retry_after if retry_after is not None else min(30.0, 2.0 * (2 ** rate_attempts))
+                    self._rate_state[self._rate_scope]["next_request_at"] = max(
+                        float(self._rate_state[self._rate_scope].get("next_request_at") or 0.0),
+                        time.monotonic() + delay,
+                    )
+                    rate_attempts += 1
+                    continue
+
+                if response.status_code >= 500 and safe_method and server_attempts < 2:
+                    delay = min(6.0, 1.5 * (2 ** server_attempts))
+                    self._rate_state[self._rate_scope]["next_request_at"] = max(
+                        float(self._rate_state[self._rate_scope].get("next_request_at") or 0.0),
+                        time.monotonic() + delay,
+                    )
+                    server_attempts += 1
+                    continue
+
+            break
 
         if response.status_code >= 400:
             detail = response.text[:400]
@@ -126,27 +246,45 @@ class CanvasService:
 
             if response.status_code in {401, 403}:
                 raise CanvasAPIError(
-                    f"Canvas rechazó la solicitud ({response.status_code}). Revise el token y los permisos asignados."
+                    f"Canvas rechazó la solicitud ({response.status_code}). Revise el token y los permisos asignados.",
+                    status_code=response.status_code,
                 )
             if response.status_code == 429:
+                retry_after = self._retry_after_seconds(response.headers.get("Retry-After"))
+                extra = f" Canvas indicó esperar aproximadamente {int(round(retry_after))} s." if retry_after else ""
                 raise CanvasAPIError(
-                    "Canvas limitó temporalmente la cantidad de consultas. Espere un momento y vuelva a intentarlo."
+                    "Canvas sigue limitando temporalmente las consultas después de los reintentos automáticos."
+                    f"{extra} La aplicación conservará los análisis de cursos que ya logró completar para no repetirlos.",
+                    status_code=429,
+                    retry_after=retry_after,
                 )
             if response.status_code >= 500:
                 raise CanvasAPIError(
-                    "Canvas presentó una interrupción temporal al procesar la consulta. Vuelva a intentarlo en unos minutos."
+                    "Canvas presentó una interrupción temporal al procesar la consulta. Vuelva a intentarlo en unos minutos.",
+                    status_code=response.status_code,
                 )
-            raise CanvasAPIError(f"Canvas no pudo completar la consulta ({response.status_code}): {detail}")
+            raise CanvasAPIError(
+                f"Canvas no pudo completar la consulta ({response.status_code}): {detail}",
+                status_code=response.status_code,
+            )
         return response
 
-    def get(self, path: str, params: dict[str, Any] | list[tuple[str, Any]] | None = None) -> Any:
-        return self._request("GET", path, params=params).json()
+    def get(
+        self,
+        path: str,
+        params: dict[str, Any] | list[tuple[str, Any]] | None = None,
+        *,
+        rate_limit_retries: int | None = None,
+    ) -> Any:
+        return self._request("GET", path, params=params, rate_limit_retries=rate_limit_retries).json()
 
     def get_paginated(
         self,
         path: str,
         params: dict[str, Any] | list[tuple[str, Any]] | None = None,
         max_pages: int = 100,
+        *,
+        rate_limit_retries: int | None = None,
     ) -> list[Any]:
         items: list[Any] = []
         url = self._url(path)
@@ -158,7 +296,12 @@ class CanvasService:
             if url in visited:
                 break
             visited.add(url)
-            response = self._request("GET", url, params=current_params)
+            response = self._request(
+                "GET",
+                url,
+                params=current_params,
+                rate_limit_retries=rate_limit_retries,
+            )
             payload = response.json()
             if isinstance(payload, list):
                 items.extend(payload)
@@ -214,12 +357,7 @@ class CanvasService:
         return self.get_paginated(path, params=params)
 
     def list_course_students(self, course_id: int | str) -> list[dict[str, Any]]:
-        """Obtiene el directorio de estudiantes con identificadores institucionales.
-
-        El endpoint de inscripciones no siempre coloca ``sis_user_id`` o
-        ``login_id`` dentro del objeto ``user``. Esta consulta complementaria
-        permite vincular correctamente el carné con la base de bienestar.
-        """
+        """Obtiene el directorio de estudiantes con identificadores institucionales."""
         params: list[tuple[str, Any]] = [
             ("per_page", 100),
             ("enrollment_type[]", "student"),
@@ -264,11 +402,7 @@ class CanvasService:
         assignment_ids: Iterable[int | str] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> list[dict[str, Any]]:
-        """Obtiene entregas en lotes pequeños para reducir tiempos de espera.
-
-        No solicita objetos de usuario ni de actividad dentro de cada entrega,
-        porque ya fueron consultados por separado durante el análisis.
-        """
+        """Obtiene entregas en lotes pequeños para reducir tiempos y costo API."""
         if section_id:
             path = f"/api/v1/sections/{section_id}/students/submissions"
         else:
@@ -279,7 +413,6 @@ class CanvasService:
         if not students:
             students = ["all"]
 
-        # Lotes conservadores: evitan una sola respuesta con miles de entregas.
         student_batches = _chunks(students, 25) if students != ["all"] else [["all"]]
         assignment_batches = _chunks(assignments, 40) if assignments else [[]]
         total_batches = len(student_batches) * len(assignment_batches)
@@ -300,19 +433,21 @@ class CanvasService:
         start_time: datetime,
         end_time: datetime,
         *,
-        max_pages: int = 5,
+        max_pages: int = 2,
+        rate_limit_retries: int = 0,
     ) -> list[dict[str, Any]]:
         params = {
             "per_page": 100,
             "start_time": start_time.isoformat(),
             "end_time": end_time.isoformat(),
         }
-        # Para una ventana semanal, 5 páginas (hasta 500 vistas) son suficientes
-        # para estimar sesiones sin dejar el análisis bloqueado durante minutos.
+        # Page Views es complementario. Se limita a 200 vistas y no insiste ante
+        # 429 para proteger las consultas esenciales de tareas y entregas.
         return self.get_paginated(
             f"/api/v1/users/{user_id}/page_views",
             params=params,
             max_pages=max_pages,
+            rate_limit_retries=rate_limit_retries,
         )
 
     def send_message(
@@ -377,62 +512,75 @@ class CanvasService:
         course_id: int | str,
         progress_callback: Callable[[int, int], None] | None = None,
         *,
-        max_workers: int = 8,
+        max_workers: int = 2,
     ) -> tuple[dict[str, int | None], dict[str, str]]:
-        """Estima sesiones en paralelo y continúa aunque Canvas niegue Page Views.
+        """Estima sesiones sin permitir que Page Views agote el cupo de Canvas.
 
-        La versión anterior hacía una consulta secuencial por estudiante. En secciones
-        grandes esto podía tardar decenas de minutos y provocar que Streamlit reiniciara
-        la ejecución antes de mostrar resultados.
+        ``max_workers`` se conserva por compatibilidad, pero las consultas se hacen
+        de forma coordinada/secuencial porque Canvas aplica penalización preventiva
+        cuando muchas solicitudes costosas salen en paralelo. Si el presupuesto
+        baja o aparece el primer 429/403, se omite Page Views para los restantes.
+        Las horas de desconexión siguen disponibles mediante ``last_activity_at``.
         """
         sessions: dict[str, int | None] = {}
         errors: dict[str, str] = {}
-        normalized_ids = [str(value) for value in user_ids if str(value)]
+        normalized_ids = list(dict.fromkeys(str(value) for value in user_ids if str(value)))
         total = len(normalized_ids)
         if not total:
             return sessions, errors
 
-        workers = max(1, min(int(max_workers), total))
-
-        def fetch_one(user_id: str) -> tuple[str, int | None, str | None]:
-            # Cada hilo usa su propia sesión HTTP, con espera corta y sin una cadena
-            # larga de reintentos. Page Views es un indicador complementario: si falla,
-            # el análisis principal debe continuar.
-            client = CanvasService(self.base_url, self.token, timeout=(8, 20))
-            adapter = HTTPAdapter(
-                max_retries=Retry(
-                    total=1, connect=1, read=1, status=1, backoff_factor=0.25,
-                    status_forcelist=(429, 500, 502, 503, 504),
-                    allowed_methods=frozenset({"GET"}),
-                    respect_retry_after_header=True,
-                    raise_on_status=False,
-                ),
-                pool_connections=2,
-                pool_maxsize=2,
-            )
-            client.session.mount("https://", adapter)
-            client.session.mount("http://", adapter)
-            try:
-                views = client.list_page_views(user_id, start_time, end_time, max_pages=5)
-                return user_id, client.count_sessions(views, course_id=course_id), None
-            except CanvasAPIError as exc:
-                return user_id, None, str(exc)
-            finally:
-                client.session.close()
-
+        stop_reason: str | None = None
         completed = 0
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="canvas-pageviews") as executor:
-            futures = {executor.submit(fetch_one, user_id): user_id for user_id in normalized_ids}
-            for future in as_completed(futures):
-                user_id = futures[future]
-                try:
-                    resolved_id, count, error = future.result()
-                except Exception as exc:  # Page Views nunca debe abortar el análisis.
-                    resolved_id, count, error = user_id, None, f"Consulta de Page Views omitida: {exc}"
-                sessions[resolved_id] = count
-                if error:
-                    errors[resolved_id] = error
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, total)
+
+        for index, user_id in enumerate(normalized_ids):
+            remaining = self.rate_limit_remaining
+            if remaining is not None and remaining <= 20:
+                stop_reason = (
+                    "Page Views se omitió para proteger el límite de Canvas; "
+                    "las horas de desconexión se mantienen con la última actividad reportada."
+                )
+                break
+
+            try:
+                views = self.list_page_views(
+                    user_id,
+                    start_time,
+                    end_time,
+                    max_pages=2,
+                    rate_limit_retries=0,
+                )
+                sessions[user_id] = self.count_sessions(views, course_id=course_id)
+            except CanvasAPIError as exc:
+                sessions[user_id] = None
+                errors[user_id] = str(exc)
+                if exc.status_code in {401, 403, 429}:
+                    if exc.status_code == 429:
+                        stop_reason = (
+                            "Canvas alcanzó temporalmente su límite durante Page Views. "
+                            "Se omitieron las consultas restantes para que continúe el análisis principal."
+                        )
+                    else:
+                        stop_reason = (
+                            "Canvas no permite consultar Page Views con este usuario/token. "
+                            "Se continuará usando la última actividad disponible."
+                        )
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed, total)
+                    break
+            except Exception as exc:  # Page Views nunca debe abortar el análisis.
+                sessions[user_id] = None
+                errors[user_id] = f"Consulta de Page Views omitida: {exc}"
+
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total)
+
+        if stop_reason:
+            for user_id in normalized_ids[completed:]:
+                sessions.setdefault(user_id, None)
+                errors.setdefault(user_id, stop_reason)
+            if progress_callback and completed < total:
+                progress_callback(total, total)
+
         return sessions, errors

@@ -212,6 +212,12 @@ with opt2:
         key="combined_zero_points",
     )
 
+if include_page_views and not demo_mode:
+    st.caption(
+        "Protección de Canvas activa: Page Views se consultará solo mientras exista margen de API. "
+        "Las horas de desconexión se calculan con la última actividad reportada por Canvas y no dependen de Page Views."
+    )
+
 
 def activity_plan_for(course_id: int | str) -> pd.DataFrame:
     session_plan = st.session_state.get(f"course_activity_plan_records_{course_id}")
@@ -255,6 +261,9 @@ if st.button(
         wellbeing = load_wellbeing_csv(WELLBEING_PATH)
         frames: list[pd.DataFrame] = []
         diagnostics: list[dict] = []
+        shared_canvas = None if demo_mode else CanvasService(canvas_url, token)
+        actual_course_cache = st.session_state.setdefault("combined_actual_course_cache", {})
+        page_view_omissions = 0
 
         for slot, (logical_course, selected_sources, week) in enumerate(
             [(course_1, selected_sections_1, week_1), (course_2, selected_sections_2, week_2)],
@@ -320,30 +329,61 @@ if st.button(
                         "section_diagnostics": demo_diags,
                     }
                 else:
-                    previous_history = (
-                        db.get_snapshot_history(course_id=actual_course["id"], limit=5000)
-                        if db.connected
-                        else pd.DataFrame()
+                    cache_key = (
+                        str(actual_course["id"]),
+                        tuple(sorted(str(value) for value in internal_ids)),
+                        int(week),
+                        analysis_date.isoformat(),
+                        bool(include_page_views),
+                        bool(include_zero_point),
                     )
-                    canvas = CanvasService(canvas_url, token)
-                    service = AnalysisService(canvas, config)
-                    dataframe, _detail, diag = service.analyze_course(
-                        course=actual_course,
-                        section_id=None,
-                        section_name=fallback_section_name,
-                        section_ids=internal_ids or None,
-                        section_name_map=section_name_map or None,
-                        week=week,
-                        analysis_date=analysis_date,
-                        include_page_views=include_page_views,
-                        include_zero_point=include_zero_point,
-                        latest_messages=latest_messages,
-                        previous_history=previous_history,
-                        activity_plan=activity_plan_for(actual_course["id"]),
-                        progress_callback=unit_progress,
-                    )
-                    dataframe = merge_wellbeing(dataframe, wellbeing)
-                    dataframe["advisor_name"] = dataframe["asesor_bienestar"]
+                    cached = actual_course_cache.get(cache_key)
+                    cache_is_fresh = False
+                    if cached:
+                        created_at = cached.get("created_at")
+                        try:
+                            cache_is_fresh = (
+                                datetime.now(timezone.utc) - created_at
+                            ).total_seconds() <= 600
+                        except (TypeError, AttributeError):
+                            cache_is_fresh = False
+
+                    if cache_is_fresh:
+                        unit_progress("reutilizando datos ya consultados", 0.92)
+                        dataframe = cached["dataframe"].copy()
+                        diag = dict(cached["diagnostics"])
+                        diag["cache_hit"] = True
+                    else:
+                        previous_history = (
+                            db.get_snapshot_history(course_id=actual_course["id"], limit=5000)
+                            if db.connected
+                            else pd.DataFrame()
+                        )
+                        service = AnalysisService(shared_canvas, config)
+                        dataframe, _detail, diag = service.analyze_course(
+                            course=actual_course,
+                            section_id=None,
+                            section_name=fallback_section_name,
+                            section_ids=internal_ids or None,
+                            section_name_map=section_name_map or None,
+                            week=week,
+                            analysis_date=analysis_date,
+                            include_page_views=include_page_views,
+                            include_zero_point=include_zero_point,
+                            latest_messages=latest_messages,
+                            previous_history=previous_history,
+                            activity_plan=activity_plan_for(actual_course["id"]),
+                            progress_callback=unit_progress,
+                        )
+                        dataframe = merge_wellbeing(dataframe, wellbeing)
+                        dataframe["advisor_name"] = dataframe["asesor_bienestar"]
+                        actual_course_cache[cache_key] = {
+                            "created_at": datetime.now(timezone.utc),
+                            "dataframe": dataframe.copy(),
+                            "diagnostics": dict(diag),
+                        }
+
+                    page_view_omissions += len(diag.get("page_view_errors") or {})
 
                 if not dataframe.empty:
                     # Conservar trazabilidad del shell real, pero unificar la materia
@@ -385,6 +425,12 @@ if st.button(
             f"Se revisaron {len(selected_sections_1)} sección(es) de {family_1['base_name']} y "
             f"{len(selected_sections_2)} sección(es) de {family_2['base_name']}."
         )
+        if include_page_views and page_view_omissions:
+            st.warning(
+                f"Canvas protegió o limitó Page Views para {page_view_omissions} consulta(s). "
+                "La derivación sí se completó: las horas de desconexión se conservaron usando "
+                "la última actividad reportada por Canvas."
+            )
     except (CanvasAPIError, DatabaseError, ValueError) as exc:
         progress.empty()
         st.error(str(exc))

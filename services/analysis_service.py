@@ -520,7 +520,7 @@ class AnalysisService:
                 end_time,
                 course_id,
                 progress_callback=page_progress,
-                max_workers=8,
+                max_workers=2,
             )
 
         messages_map = self._message_map(latest_messages if latest_messages is not None else pd.DataFrame())
